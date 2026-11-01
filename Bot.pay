@@ -1,0 +1,184 @@
+import os
+import time
+import requests
+import yfinance as yf
+import pandas as pd
+
+# Telegram credentials
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# Forex pairs
+PAIRS = {
+    "XAUUSD": "XAUUSD=X",
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X"
+}
+
+sent_signals = set()
+
+
+def send_telegram(message):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram credentials missing!")
+        return
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    try:
+        requests.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "text": message
+            },
+            timeout=15
+        )
+    except Exception as e:
+        print("Telegram error:", e)
+
+
+def get_market_data(symbol):
+    try:
+        df = yf.download(
+            symbol,
+            period="2d",
+            interval="1m",
+            progress=False
+        )
+
+        if df.empty:
+            return None
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df[["Open", "High", "Low", "Close"]]
+        df = df.dropna()
+
+        return df
+
+    except Exception as e:
+        print("Data error:", e)
+        return None
+
+
+def check_signal(pair, symbol):
+
+    df = get_market_data(symbol)
+
+    if df is None or len(df) < 100:
+        return
+
+    # Create 1-hour candles
+    hourly = df.resample("1h").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last"
+    }).dropna()
+
+    if len(hourly) < 22:
+        return
+
+    # Latest completed hourly candle
+    previous = hourly.iloc[-22:-2]
+    last_hour = hourly.iloc[-2]
+
+    # Liquidity sweep
+    buy_sweep = (
+        last_hour["Low"] < previous["Low"].min()
+        and last_hour["Close"] > previous["Low"].min()
+    )
+
+    sell_sweep = (
+        last_hour["High"] > previous["High"].max()
+        and last_hour["Close"] < previous["High"].max()
+    )
+
+    # 1-minute market structure
+    recent = df.iloc[-20:-1]
+    current = df.iloc[-1]
+
+    buy_mss = current["Close"] > recent["High"].max()
+    sell_mss = current["Close"] < recent["Low"].min()
+
+    signal = None
+
+    if buy_sweep and buy_mss:
+        signal = "BUY"
+
+    elif sell_sweep and sell_mss:
+        signal = "SELL"
+
+    if signal is None:
+        return
+
+    signal_id = f"{pair}_{signal}_{df.index[-1]}"
+
+    if signal_id in sent_signals:
+        return
+
+    sent_signals.add(signal_id)
+
+    entry = float(current["Close"])
+
+    if signal == "BUY":
+        sl = float(last_hour["Low"])
+        risk = entry - sl
+        if risk <= 0:
+            return
+        tp = entry + (risk * 2)
+
+    else:
+        sl = float(last_hour["High"])
+        risk = sl - entry
+        if risk <= 0:
+            return
+        tp = entry - (risk * 2)
+
+    message = f"""
+🚨 FOREX SIGNAL
+
+Pair: {pair}
+Signal: {signal}
+
+Entry: {entry:.5f}
+Stop Loss: {sl:.5f}
+Take Profit: {tp:.5f}
+
+Risk Reward: 1:2
+
+Strategy:
+1H Liquidity Sweep
+1M MSS
+
+⚠️ Educational signal only.
+Verify before trading.
+"""
+
+    send_telegram(message)
+    print(message)
+
+
+def main():
+
+    print("Forex Signal Bot Started!")
+
+    send_telegram("🤖 Forex Signal Bot Started!")
+
+    while True:
+
+        for pair, symbol in PAIRS.items():
+
+            try:
+                check_signal(pair, symbol)
+
+            except Exception as e:
+                print(pair, e)
+
+        time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()
